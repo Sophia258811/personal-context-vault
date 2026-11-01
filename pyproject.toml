@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "personal-context-vault"
+version = "0.2.0"
+description = "Local-first, evidence-backed personal context store"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+pcv = "pcv.cli:main"
+
+[tool.setuptools]
+packages = ["pcv"]
