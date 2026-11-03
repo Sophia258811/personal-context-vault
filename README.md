@@ -1,5 +1,7 @@
 # Personal Context Vault
 
+Windows 用户可双击 `Start-PCV.cmd` 合并启动接收和入库；首次安装与配对见 [一键启动说明](docs/QUICK_START.md)。
+
 **Experimental prototype v0.2.0 — not production-ready.** Python 3.11+，无 Python 第三方运行依赖。
 
 本项目探索跨平台、多来源的个人信息理解：本地导入与浏览器伴随采集 → 证据库 → Agent 摘要 → 待确认画像。代码公开，用户数据保留在本机。

@@ -1,25 +1,39 @@
 const status = document.querySelector('#status');
-chrome.storage.session.get('status').then(x => { status.textContent = x.status || '尚未开始'; });
+const detail = document.querySelector('#detail');
+let renderGeneration = 0;
+async function render() {
+  const generation = ++renderGeneration;
+  const [settings, recent] = await Promise.all([
+    chrome.storage.local.get(['running', 'token']), chrome.storage.session.get('status')
+  ]);
+  if (generation !== renderGeneration) return;
+  // The persistent switch is authoritative; a previous transfer message is not.
+  status.textContent = settings.running ? '采集已开启（仅已授权范围）' : '采集已暂停';
+  detail.textContent = settings.running && recent.status && !recent.status.includes('暂停') ? recent.status : '';
+  if (settings.token) document.querySelector('#token').placeholder = '已配对，无需重复输入';
+}
+render().catch(() => { status.textContent = '无法读取配置，请重新加载扩展'; });
 document.querySelector('#start').onclick = async () => {
+  ++renderGeneration;
   try {
     const [tab] = await chrome.tabs.query({active: true, currentWindow: true});
-    const url = new URL(tab.url);
-    if (!['https:', 'http:'].includes(url.protocol)) throw new Error('仅支持网页');
-    const granted = await chrome.permissions.request({origins: [url.origin + '/*']});
-    if (!granted) throw new Error('未授权该站点');
-    const saved = await chrome.storage.session.get(['token', 'enabled']);
+    const all = document.querySelector('#scope').value === 'all';
+    if (!all && !/^https?:/.test(tab.url)) throw new Error('请先打开普通网页');
+    const origins = all ? ['https://*/*', 'http://*/*'] : [new URL(tab.url).origin + '/*'];
+    if (!await chrome.permissions.request({origins})) throw new Error('未授权，尚未开始');
+    const saved = await chrome.storage.local.get(['token', 'origins']);
     const token = document.querySelector('#token').value.trim() || saved.token;
-    if (!token) throw new Error('请输入配对码');
-    const enabled = saved.enabled || {};
-    enabled[tab.id] = url.origin;
-    await chrome.storage.session.set({token, enabled, status: '当前标签页在已授权站点持续采集'});
-    await chrome.scripting.executeScript({target: {tabId: tab.id}, files: ['capture.js']});
-    await chrome.action.setBadgeText({text: 'ON'});
-    status.textContent = '已开始；本站跳转自动继续，跨站需再次授权';
-  } catch (e) { status.textContent = e.message; }
+    if (!token) throw new Error('首次请从 PCV 窗口复制配对码');
+    await chrome.storage.local.set({token, running: true, origins: [...new Set([...(saved.origins || []), ...origins])]});
+    await chrome.storage.session.set({status: '等待页面发送；开启不代表已收到记录'});
+    await render();
+    await chrome.runtime.sendMessage({type: 'refresh-capture'});
+  } catch (e) { detail.textContent = e.message; }
 };
 document.querySelector('#stop').onclick = async () => {
-  await chrome.storage.session.set({enabled: {}, status: '已暂停全部'});
-  await chrome.action.setBadgeText({text: ''});
-  status.textContent = '已暂停全部';
+  ++renderGeneration;
+  await chrome.storage.local.set({running: false});
+  await chrome.storage.session.set({status: '已暂停全部'});
+  await render();
+  await chrome.runtime.sendMessage({type: 'refresh-capture'});
 };

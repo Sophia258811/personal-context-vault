@@ -8,9 +8,10 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
+from .observation import structured_fields
 
 
-def create_server(inbox, token, port=8765):
+def create_server(inbox, token, port=8765, on_saved=None):
     inbox = Path(inbox)
     inbox.mkdir(parents=True, exist_ok=True)
     lock = threading.Lock()
@@ -55,11 +56,14 @@ def create_server(inbox, token, port=8765):
                     'text': text, 'created_at': now,
                     'interpretation': 'Exposure is not endorsement or verified reading.',
                 }
+                record.update(structured_fields(event, url.hostname))
                 with lock:
                     target = inbox / (record['id'] + '.json')
                     temporary = target.with_suffix('.tmp')
                     temporary.write_text(json.dumps(record, ensure_ascii=False), encoding='utf-8')
                     temporary.replace(target)
+                if on_saved:
+                    on_saved(target)
             except (ValueError, KeyError, TypeError):
                 return self.reply(400)
             except OSError:

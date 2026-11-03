@@ -4,14 +4,14 @@ const fs = require('node:fs');
 const assert = require('node:assert/strict');
 const path = require('node:path');
 const handlers = {};
-const state = {token: 'synthetic', enabled: {7: 'https://example.org'}};
+const state = {token: 'synthetic', running: true, origins: ['https://example.org/*']};
 let injections = 0;
 let requests = 0;
 const chrome = {
-  runtime: {onMessage: {addListener: f => handlers.message = f}},
+  runtime: {onMessage: {addListener: f => handlers.message = f}, onStartup: {addListener: f => handlers.startup = f}},
   tabs: {onUpdated: {addListener: f => handlers.updated = f}, onRemoved: {addListener: f => handlers.removed = f}},
-  storage: {session: {get: async () => state, set: async x => Object.assign(state, x)}},
-  permissions: {contains: async () => true},
+  storage: {local: {get: async () => state, set: async x => Object.assign(state, x)}, session: {get: async () => state, set: async x => Object.assign(state, x)}},
+  permissions: {contains: async () => true, onRemoved: {addListener: f => handlers.permissions = f}},
   scripting: {executeScript: async () => injections++},
   action: {setBadgeText: async () => {}}
 };
@@ -24,7 +24,7 @@ vm.runInNewContext(fs.readFileSync(path.join(__dirname, '../browser-extension/ba
   }
 });
 (async () => {
-  await handlers.updated(7, {status: 'complete'}, {url: 'https://example.org/next'});
+  await handlers.updated(7, {status: 'complete'}, {id: 7, url: 'https://example.org/next'});
   assert.equal(injections, 1);
   await handlers.updated(7, {status: 'complete'}, {url: 'https://other.example/'});
   assert.equal(injections, 1);
@@ -32,10 +32,19 @@ vm.runInNewContext(fs.readFileSync(path.join(__dirname, '../browser-extension/ba
     {type: 'capture', event: {url: 'https://forged.example/', text: 'synthetic'}},
     {tab: {id: 7}, url: 'https://example.org/read'}, resolve));
   assert.equal((await send()).ok, true);
-  state.enabled = {};
+  state.running = false;
   assert.equal((await send()).paused, true);
   assert.equal(requests, 1);
   await handlers.updated(7, {status: 'complete'}, {url: 'https://example.org/next'});
   assert.equal(injections, 1);
+  state.running = true;
+  state.origins = ['https://*/*'];
+  await handlers.updated(8, {status: 'complete'}, {id: 8, url: 'https://new.example/'});
+  assert.equal(injections, 2);
+  await handlers.updated(9, {status: 'complete'}, {id: 9, url: 'https://new.example/', incognito: true});
+  assert.equal(injections, 2);
+  chrome.permissions.contains = async () => false;
+  assert.equal((await send()).paused, true);
+  assert.equal(requests, 1);
   console.log('PASS: navigation, cross-origin isolation, sender URL, pause');
 })().catch(error => { console.error(error); process.exitCode = 1; });

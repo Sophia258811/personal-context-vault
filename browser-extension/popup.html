@@ -2,6 +2,8 @@
 <body style="width:300px;font:14px sans-serif;padding:12px">
 <h3>伴随浏览</h3>
 <p>开始后，每 15 秒保存当前可见页面片段到本机。页面正文可能包含私人信息。</p>
-<input id="token" type="password" placeholder="粘贴本地接收端的配对码" aria-label="配对码">
-<p><button id="start">开始当前页</button> <button id="stop">暂停全部</button></p>
-<p id="status"></p><script src="popup.js"></script></body></html>
+<input id="token" type="password" placeholder="首次粘贴 PCV 窗口中的配对码" aria-label="配对码">
+<p><label>新增采集范围 <select id="scope"><option value="site">当前站点</option><option value="all">所有 HTTP/HTTPS 网站</option></select></label></p>
+<p>范围累积保存，重启浏览器后自动恢复。收窄范围请在扩展设置撤销站点权限；暂停停止全部发送。</p>
+<p><button id="start">开始／添加范围</button> <button id="stop">暂停全部</button></p>
+<p id="status"></p><p id="detail" aria-live="polite"></p><script src="popup.js"></script></body></html>

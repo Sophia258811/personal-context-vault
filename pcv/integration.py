@@ -1,6 +1,10 @@
 """Conservative content grouping; observations remain independently traceable."""
 import hashlib
 import json
+import argparse
+import sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
 
 
 def integrate(observations):
@@ -46,3 +50,45 @@ def integrate(observations):
         group['observations'].append(json.loads(serialized))
         group['available_modalities'] = sorted(set(group['available_modalities']) | set(modalities))
     return list(groups.values())
+
+
+def from_database(database, source_id):
+    connection = sqlite3.connect(Path(database).resolve().as_uri() + '?mode=ro', uri=True)
+    connection.row_factory = sqlite3.Row
+    observations = []
+    try:
+        rows = connection.execute('''SELECT e.id,e.content,s.expires_at FROM evidence e
+            JOIN sources s ON s.id=e.source_id WHERE s.id=? AND s.status='active'
+            ORDER BY e.id''', (source_id,))
+        for row in rows:
+            if row['expires_at']:
+                expiry = datetime.fromisoformat(row['expires_at'].replace('Z', '+00:00'))
+                if expiry.tzinfo is None or expiry <= datetime.now(timezone.utc):
+                    continue
+            try:
+                record = json.loads(row['content'])
+            except ValueError:
+                continue
+            if not isinstance(record, dict) or record.get('event_type') != 'page_observed':
+                continue
+            observations.append({**record, 'source_id': source_id,
+                'observation_id': str(row['id']), 'evidence_id': row['id'],
+                'platform': record.get('platform', 'browser'),
+                'available_modalities': record.get('available_modalities', ['text'])})
+        return integrate(observations)
+    finally:
+        connection.close()
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Group authorized browser evidence without deleting observations')
+    parser.add_argument('--db', default='.pcv/vault.db')
+    parser.add_argument('--source', type=int, required=True)
+    parser.add_argument('--output', type=Path, help='Optional private JSON export including content')
+    args = parser.parse_args()
+    groups = from_database(args.db, args.source)
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps(groups, ensure_ascii=False, indent=2), encoding='utf-8')
+    print(json.dumps({'groups': len(groups), 'observations': sum(len(g['observations']) for g in groups),
+        'unresolved_groups': sum(g['identity_status'] == 'unresolved' for g in groups)}, indent=2))
