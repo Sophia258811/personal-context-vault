@@ -45,7 +45,9 @@ def main():
                 capture_output=True, encoding="utf-8", timeout=60,
             )
         except subprocess.TimeoutExpired as error:
-            diagnostics = (error.stderr or error.stdout or b"").decode("utf-8", errors="replace")
+            diagnostics = error.stderr or error.stdout or ""
+            if isinstance(diagnostics, bytes):
+                diagnostics = diagnostics.decode("utf-8", errors="replace")
             raise SystemExit("Fresh Codex session timed out.\n" + diagnostics[-2000:]) from None
         if result.returncode:
             raise SystemExit(result.stderr[-2000:] or result.stdout[-2000:])
