@@ -2,13 +2,16 @@
 import ctypes
 from ctypes import wintypes
 import secrets
+import sys
 import threading
+from contextlib import closing
 from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox
-from .companion import create_server
+from .companion import create_server, desktop_ready_path
 from .connectors import sync_connector
 from .store import Store
+from . import stream_media, stream_processing
 
 
 class Blob(ctypes.Structure):
@@ -59,24 +62,40 @@ def configure(root):
         store.close()
 
 
-def main():
+def main(quiet_start=False, minimized=False):
     window = tk.Tk()
+    if minimized:
+        window.iconify()
     window.title('PCV 伴随采集')
-    window.geometry('540x280')
+    window.geometry('540x320')
     root = Path(__file__).resolve().parents[1] / '.pcv'
     root.mkdir(exist_ok=True)
     status = tk.StringVar(value='正在启动…')
-    stopped, pending = threading.Event(), threading.Event()
-    report = {'text': '接收端已启动，等待页面。'}
+    stopped, pending, media_pending = threading.Event(), threading.Event(), threading.Event()
+    report = {'text': '接收端已启动，等待页面。', 'media': '音画：等待授权片段。'}
     server = None
+
+    def receive_media(payload):
+        with closing(Store(root / 'vault.db')) as store:
+            connector = store.get_connector(connector_id)
+            if not connector['enabled']:
+                raise stream_media.InactiveMediaSource('browser source is disabled')
+            stream_media.ingest(store, connector['source_id'], payload)
+        media_pending.set()
+
     try:
         token = pairing_token(root)
-        server = create_server(root / 'browser-inbox', token, on_saved=lambda _: pending.set())
+        server = create_server(root / 'browser-inbox', token, on_saved=lambda _: pending.set(),
+                               ready_path=desktop_ready_path(root), on_media=receive_media)
         connector_id = configure(root)
+        with closing(Store(root / 'vault.db')) as store:
+            stream_media.initialize(store)
+            stream_processing.initialize(store)
     except Exception as error:
         if server:
             server.server_close()
-        messagebox.showerror('无法启动', '检查 8765 端口是否被旧接收端占用，以及来源是否有效。\n' + str(error))
+        if not quiet_start:
+            messagebox.showerror('无法启动', '检查 8765 端口是否被旧接收端占用，以及来源是否有效。\n' + str(error))
         window.destroy()
         return
 
@@ -101,16 +120,37 @@ def main():
         window.clipboard_append(token)
         status.set('配对码已复制，首次粘贴到扩展；后续无需重复配对。')
 
+    def media_worker():
+        with closing(Store(root / 'vault.db')) as store:
+            while not stopped.is_set():
+                media_pending.wait(15)
+                media_pending.clear()
+                if stopped.is_set():
+                    break
+                try:
+                    stream_processing.expire_processed_media(store)
+                    if not store.get_connector(connector_id)['enabled']:
+                        continue
+                    while not stopped.is_set():
+                        report['media'] = '音画：正在检查待处理片段。'
+                        result = stream_processing.process_next(store)
+                        if result is None:
+                            report['media'] = '音画：已处理片段可通过 CLI 查询。'
+                            break
+                except Exception:
+                    report['media'] = '音画处理暂时失败，稍后重试。'
+
     def stop():
         stopped.set()
         pending.set()
+        media_pending.set()
         server.shutdown()
         server.server_close()
         importer.join(timeout=3)
         window.destroy()
 
     def refresh():
-        status.set(report['text'])
+        status.set(report['text'] + '\n' + report['media'])
         window.after(5000, refresh)
 
     tk.Label(window, text='PCV 已就绪', font=('Microsoft YaHei UI', 18)).pack(pady=12)
@@ -119,13 +159,15 @@ def main():
     tk.Label(window, textvariable=status, wraplength=510).pack(pady=6)
     tk.Button(window, text='停止并退出', command=stop).pack()
     window.protocol('WM_DELETE_WINDOW', stop)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
     importer = threading.Thread(target=worker, daemon=True)
     importer.start()
+    threading.Thread(target=media_worker, daemon=True).start()
+    threading.Thread(target=server.serve_forever, daemon=True).start()
     pending.set()
+    media_pending.set()
     refresh()
     window.mainloop()
 
 
 if __name__ == '__main__':
-    main()
+    main(quiet_start='--quiet-start' in sys.argv[1:], minimized='--minimized' in sys.argv[1:])

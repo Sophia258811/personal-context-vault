@@ -2,6 +2,81 @@ if (!globalThis.pcvCompanionInstalled) {
   globalThis.pcvCompanionInstalled = true;
   let last = '';
   let busy = false;
+  let mediaWatch;
+  let mediaTimer;
+  let previousPlayer;
+
+  async function sendMediaBeat(beat) {
+    const session = mediaWatch;
+    if (!session) return;
+    try {
+      const response = await chrome.runtime.sendMessage({target: 'pcv-media', action: 'beat', session, beat});
+      if (!response?.ok && session === mediaWatch) stopWatchingMedia();
+    } catch {
+      if (session === mediaWatch) stopWatchingMedia();
+    }
+  }
+
+  function invalidateMedia() { sendMediaBeat(null); }
+  const mediaEvents = ['pause', 'seeking', 'waiting', 'ended', 'emptied', 'ratechange', 'volumechange'];
+  function stopWatchingMedia() {
+    clearInterval(mediaTimer);
+    mediaWatch = undefined;
+    for (const event of mediaEvents) previousPlayer?.removeEventListener(event, invalidateMedia);
+    previousPlayer = undefined;
+  }
+
+  function measureMedia() {
+    if (document.visibilityState !== 'visible' || !document.hasFocus() || document.pictureInPictureElement ||
+        window.visualViewport?.scale !== 1 || !innerWidth || !innerHeight) return invalidateMedia();
+    const visible = [...document.querySelectorAll('video')].filter(video => {
+      const rect = video.getBoundingClientRect();
+      return rect.width >= 80 && rect.height >= 80 && rect.right > 0 && rect.bottom > 0 &&
+        rect.left < innerWidth && rect.top < innerHeight &&
+        (!video.checkVisibility || video.checkVisibility({checkOpacity: true, checkVisibilityCSS: true}));
+    });
+    const video = globalThis.pcvAdapters.selectVideo(visible);
+    if (video !== previousPlayer) {
+      for (const event of mediaEvents) {
+        previousPlayer?.removeEventListener(event, invalidateMedia);
+        video?.addEventListener(event, invalidateMedia);
+      }
+      previousPlayer = video;
+    }
+    if (!video || video.paused || video.seeking || video.ended || video.readyState < 3 ||
+        video.playbackRate < 0.5 || video.playbackRate > 2) return invalidateMedia();
+    const identity = globalThis.pcvAdapters.identity(location.href, video);
+    if (!identity.platform_content_id) return invalidateMedia();
+    for (const element of document.querySelectorAll('audio,video')) {
+      if (element !== video && !element.paused && !element.muted && element.volume > 0) return invalidateMedia();
+    }
+    const rect = video.getBoundingClientRect();
+    const left = Math.max(rect.left, 0);
+    const top = Math.max(rect.top, 0);
+    const right = Math.min(rect.right, innerWidth);
+    const bottom = Math.min(rect.bottom, innerHeight);
+    if (right - left < rect.width * 0.6 || bottom - top < rect.height * 0.6) return invalidateMedia();
+    sendMediaBeat({
+      ...identity, position_seconds: video.currentTime, rate: video.playbackRate,
+      audible: !video.muted && video.volume > 0,
+      viewport: {width: innerWidth, height: innerHeight},
+      rect: {left: left / innerWidth, top: top / innerHeight, right: right / innerWidth, bottom: bottom / innerHeight}
+    });
+  }
+
+  chrome.runtime.onMessage.addListener(message => {
+    if (message.type === 'pcv-media-watch') {
+      stopWatchingMedia();
+      mediaWatch = message.session;
+      mediaTimer = setInterval(measureMedia, 500);
+      measureMedia();
+    } else if (message.type === 'pcv-media-unwatch' && message.session === mediaWatch) {
+      stopWatchingMedia();
+    }
+  });
+  document.addEventListener('visibilitychange', invalidateMedia);
+  window.addEventListener('blur', invalidateMedia);
+  window.addEventListener('pagehide', () => { invalidateMedia(); stopWatchingMedia(); });
   async function capture() {
     if (busy || document.visibilityState !== 'visible' || !document.hasFocus()) return;
     busy = true;

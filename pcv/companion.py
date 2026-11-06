@@ -1,17 +1,30 @@
 """Loopback receiver for explicitly enabled browser companion sessions."""
 import argparse
+import hashlib
 import hmac
 import json
+import os
 import secrets
+import socket
+import sqlite3
 import threading
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 from .observation import structured_fields
+from .stream_media import MAX_BODY, InactiveMediaSource, MediaCapacityError, MediaConflict
 
 
-def create_server(inbox, token, port=8765, on_saved=None):
+PORT = 8765
+
+
+def desktop_ready_path(root):
+    path = os.path.normcase(str(Path(root).resolve()))
+    return '/desktop-ready/' + hashlib.sha256(os.fsencode(path)).hexdigest()
+
+
+def create_server(inbox, token, port=PORT, on_saved=None, ready_path=None, on_media=None):
     inbox = Path(inbox)
     inbox.mkdir(parents=True, exist_ok=True)
     lock = threading.Lock()
@@ -29,16 +42,28 @@ def create_server(inbox, token, port=8765, on_saved=None):
             self.send_header('Content-Length', '0')
             self.end_headers()
 
+        def do_GET(self):
+            ready = self.path == ready_path or (self.path == '/media-ready' and on_media is not None)
+            self.reply(204 if ready else 404)
+
         def do_POST(self):
-            if self.path != '/events':
+            is_media = self.path == '/media' and on_media is not None
+            if not is_media and self.path != '/events':
                 return self.reply(404)
-            if not hmac.compare_digest(self.headers.get('Authorization', ''), 'Bearer ' + token):
+            if not hmac.compare_digest(self.headers.get('Authorization', '').encode('latin-1'),
+                                       ('Bearer ' + token).encode('utf-8')):
                 return self.reply(401)
             try:
                 length = int(self.headers.get('Content-Length', '0'))
-                if not 0 < length <= 100000:
+                if not 0 < length <= (MAX_BODY if is_media else 100000):
                     return self.reply(413)
-                event = json.loads(self.rfile.read(length))
+                body = self.rfile.read(length)
+                if len(body) != length:
+                    return self.reply(400)
+                event = json.loads(body)
+                if is_media:
+                    on_media(event)
+                    return self.reply(204)
                 if not isinstance(event, dict) or not isinstance(event.get('url'), str):
                     raise ValueError('event')
                 url = urlsplit(event['url'])
@@ -64,19 +89,37 @@ def create_server(inbox, token, port=8765, on_saved=None):
                     temporary.replace(target)
                 if on_saved:
                     on_saved(target)
-            except (ValueError, KeyError, TypeError):
+            except MediaConflict:
+                return self.reply(409)
+            except InactiveMediaSource:
+                return self.reply(403)
+            except MediaCapacityError:
+                return self.reply(507)
+            except (ValueError, KeyError, TypeError, RecursionError):
                 return self.reply(400)
-            except OSError:
+            except sqlite3.OperationalError as exc:
+                code = getattr(exc, 'sqlite_errorcode', 0) & 0xff
+                return self.reply(503 if code in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED) else 500)
+            except (OSError, sqlite3.Error):
                 return self.reply(500)
             self.reply(204)
 
-    return ThreadingHTTPServer(('127.0.0.1', port), Handler)
+    class Receiver(ThreadingHTTPServer):
+        allow_reuse_address = os.name != 'nt'
+        allow_reuse_port = False
+
+        def server_bind(self):
+            if os.name == 'nt':
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            super().server_bind()
+
+    return Receiver(('127.0.0.1', port), Handler)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--inbox', type=Path, default=Path('.pcv/browser-inbox'))
-    parser.add_argument('--port', type=int, default=8765)
+    parser.add_argument('--port', type=int, default=PORT)
     args = parser.parse_args()
     token = secrets.token_urlsafe(32)
     server = create_server(args.inbox, token, args.port)

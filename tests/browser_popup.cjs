@@ -3,40 +3,100 @@ const fs = require('node:fs');
 const path = require('node:path');
 const assert = require('node:assert/strict');
 const source = fs.readFileSync(path.join(__dirname, '../browser-extension/popup.js'), 'utf8');
-const state = {running: true, token: 'synthetic', origins: ['https://example.org/*']};
-const session = {status: '已暂停全部'};
-let elements;
-async function open(delay) {
-  elements = Object.fromEntries(['status','detail','token','scope','start','stop'].map(k => ['#' + k, {value: k === 'scope' ? 'site' : '', textContent: ''}]));
+const tab = {id: 7, url: 'https://www.douyin.com/video/123'};
+const origin = new URL(tab.url).origin;
+const messages = [];
+const requests = [];
+const granted = new Set();
+const status = {running: false, paired: true, siteAuthorized: false, mediaSupported: true,
+  currentMedia: false, attempted: false, busy: false, media: {state: 'idle'},
+  textStatus: '已保存最近页面片段'};
+let allow = true;
+let mediaResult = {state: 'running'};
+let statusWait;
+
+async function open() {
+  const elements = Object.fromEntries(['toggle', 'status', 'detail', 'settings', 'pairing', 'token',
+    'scope', 'pauseAll'].map(id => ['#' + id, {textContent: '', value: id === 'scope' ? 'site' : '',
+      focus() { this.focused = true; }, addEventListener(event, handler) { this['on' + event] = handler; }}]));
   const chrome = {
-    storage: {
-      local: {get: async () => { if (delay) await new Promise(r => setTimeout(r, delay)); return {...state}; }, set: async x => Object.assign(state,x)},
-      session: {get: async () => ({...session}), set: async x => Object.assign(session,x)}
+    tabs: {query: async () => [tab]},
+    storage: {onChanged: {addListener: callback => { elements.refresh = callback; }}},
+    permissions: {
+      contains: async request => request.origins.every(pattern => granted.has(pattern)),
+      request: async request => {
+        assert.ok(request.origins, 'popup must only request the chosen site scope');
+        requests.push([...request.origins]);
+        if (allow) request.origins.forEach(pattern => granted.add(pattern));
+        return allow;
+      },
     },
-    tabs: {query: async () => [{url: 'https://example.org/'}]},
-    permissions: {request: async () => true}, runtime: {sendMessage: async () => ({ok:true})}
+    runtime: {sendMessage: async message => {
+      assert.equal(message.type, 'capture-control');
+      assert.equal(message.tabId, tab.id);
+      assert.equal(message.origin, origin);
+      messages.push({...message});
+      status.siteAuthorized = granted.has(origin + '/*');
+      if (message.action === 'start') {
+        if (!status.paired && !message.token) return {...status, error: 'pairing_needed'};
+        Object.assign(status, {paired: true, running: true, currentMedia: mediaResult.state === 'running',
+          attempted: true, media: mediaResult, textStatus: '已保存最近页面片段'});
+      } else if (message.action === 'stop') {
+        Object.assign(status, {running: false, currentMedia: false, media: {state: 'stopped'}});
+      }
+      const snapshot = {...status};
+      if (message.action === 'status' && statusWait) await statusWait;
+      return snapshot;
+    }},
   };
-  const context = {chrome, URL, document: {querySelector: k => elements[k]}};
-  vm.runInNewContext(source, context);
-  await new Promise(r => setTimeout(r, delay + 10));
+  vm.runInNewContext(source, {chrome, URL, setTimeout: () => 0, clearTimeout: () => {},
+    document: {querySelector: key => elements[key]}});
+  await new Promise(resolve => setImmediate(resolve));
+  return elements;
 }
+
 (async () => {
-  for (const delay of [0,20]) {
-    await open(delay);
-    assert.match(elements['#status'].textContent, /已开启/);
-    assert.equal(elements['#detail'].textContent, '');
-  }
-  await elements['#stop'].onclick();
-  assert.equal(state.running, false);
-  await elements['#start'].onclick();
-  assert.equal(state.running, true);
-  assert.ok(!session.status.includes('暂停'));
-  await open(0);
-  assert.match(elements['#status'].textContent, /已开启/);
-  state.running = false;
-  session.status = '已保存最近页面片段';
-  await open(0);
-  assert.match(elements['#status'].textContent, /已暂停/);
-  assert.equal(elements['#detail'].textContent, '');
-  console.log('PASS: stale pause, reopen, asynchronous order, stop/start, stale success');
-})().catch(error => {console.error(error); process.exitCode=1;});
+  let elements = await open();
+  assert.match(elements['#toggle'].textContent, /开始|继续/);
+  assert.doesNotMatch(elements['#status'].textContent, /采集已开启/);
+  allow = false;
+  await elements['#toggle'].onclick();
+  assert.equal(messages.some(message => message.action === 'start'), false);
+  allow = true;
+  await elements['#toggle'].onclick();
+  assert.deepEqual(requests, [[origin + '/*'], [origin + '/*']]);
+  assert.equal(messages.filter(message => message.action === 'start').length, 1);
+  assert.equal(messages.find(message => message.action === 'start').scope, 'site');
+  assert.match(elements['#toggle'].textContent, /暂停/);
+
+  elements = await open();
+  assert.match(elements['#toggle'].textContent, /暂停/);
+  let finishRefresh;
+  statusWait = new Promise(resolve => { finishRefresh = resolve; });
+  const oldStatus = elements.refresh();
+  await elements['#toggle'].onclick();
+  finishRefresh();
+  await oldStatus;
+  statusWait = undefined;
+  assert.equal(messages.at(-1).action, 'stop');
+  assert.match(elements['#toggle'].textContent, /开始|继续/);
+  assert.doesNotMatch(elements['#status'].textContent, /采集已开启/);
+
+  mediaResult = {state: 'unavailable', diagnostic: {stage: 'audio_worklet', reason: 'timeout'}};
+  await elements['#toggle'].onclick();
+  const report = [elements['#status'].textContent, elements['#detail'].textContent].join(' ');
+  assert.match(report, /文字/);
+  assert.match(report, /初始化音频编码/);
+  assert.match(report, /超时/);
+  assert.match(elements['#toggle'].textContent, /暂停/);
+  assert.equal(requests.length, 2, 'restarting an authorized site should not request new permissions');
+  await elements['#toggle'].onclick();
+
+  status.paired = false;
+  elements = await open();
+  await elements['#toggle'].onclick();
+  assert.equal(elements['#settings'].open, true);
+  assert.equal(elements['#token'].focused, true);
+  assert.match(elements['#toggle'].textContent, /开始|继续/);
+  console.log('PASS: single capture control, site-scoped consent, status on reopen, and distinct audio and pairing diagnostics');
+})().catch(error => { console.error(error); process.exitCode = 1; });

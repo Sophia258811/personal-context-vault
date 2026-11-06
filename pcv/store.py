@@ -305,6 +305,17 @@ class Store:
         occurred_at: str | None = None,
         sensitivity: str = "medium",
     ) -> int:
+        with self.connection:
+            self.connection.execute("BEGIN IMMEDIATE")
+            return self._insert_evidence(
+                source_id=source_id, title=title, content=content, locator=locator,
+                occurred_at=occurred_at, sensitivity=sensitivity,
+            )
+
+    def _insert_evidence(
+        self, *, source_id: int, title: str, content: str, locator: str | None = None,
+        occurred_at: str | None = None, sensitivity: str = "medium",
+    ) -> int:
         source = self._require_source(source_id)
         if source["status"] != "active":
             raise ValueError("source must be active")
@@ -337,7 +348,6 @@ class Store:
             evidence_id,
             {"source_id": source_id, "content_hash": digest},
         )
-        self.connection.commit()
         return evidence_id
 
     def list_evidence(self, *, include_content: bool = False) -> list[dict[str, Any]]:
@@ -450,6 +460,31 @@ class Store:
         *,
         status: str,
         allow_conflicts: bool = False,
+        replaces: int | None = None,
+    ) -> None:
+        with self.connection:
+            self.connection.execute("BEGIN IMMEDIATE")
+            if replaces is not None:
+                if status != "confirmed" or replaces == claim_id:
+                    raise ValueError("replacement requires a different claim and confirmed status")
+                candidate = self.connection.execute(
+                    "SELECT review_status FROM claims WHERE id = ? "
+                    "AND (valid_from IS NULL OR julianday(valid_from) <= julianday('now')) "
+                    "AND (valid_to IS NULL OR julianday(valid_to) > julianday('now'))", (claim_id,)
+                ).fetchone()
+                if candidate is None or candidate["review_status"] not in {"pending", "needs_review"}:
+                    raise ValueError("replacement must be a pending or needs_review claim")
+                retired = self.connection.execute(
+                    "UPDATE claims SET review_status = 'stale', updated_at = ? "
+                    "WHERE id = ? AND review_status = 'confirmed'",
+                    (utc_now(), replaces),
+                )
+                if retired.rowcount != 1:
+                    raise ValueError("replaced claim must be confirmed")
+            self._review_claim(claim_id, status, allow_conflicts, replaces)
+
+    def _review_claim(
+        self, claim_id: int, status: str, allow_conflicts: bool, replaces: int | None
     ) -> None:
         self._validate_choice("review_status", status, REVIEW_STATUSES)
         claim = self.connection.execute(
@@ -477,9 +512,9 @@ class Store:
             "claim.review",
             "claim",
             claim_id,
-            {"status": status, "allow_conflicts": allow_conflicts},
+            {"status": status, "allow_conflicts": allow_conflicts,
+             **({"replaces": replaces} if replaces is not None else {})},
         )
-        self.connection.commit()
 
     def export_profile(
         self, *, include_pending: bool = False
@@ -742,7 +777,11 @@ class Store:
     def _evidence_count(
         self, claim_id: int, relation: str, *, active_only: bool
     ) -> int:
-        active_clause = "AND s.status = 'active'" if active_only else ""
+        active_clause = (
+            "AND s.status = 'active' "
+            "AND (s.expires_at IS NULL OR julianday(s.expires_at) > julianday('now'))"
+            if active_only else ""
+        )
         row = self.connection.execute(
             f"""
             SELECT COUNT(*)

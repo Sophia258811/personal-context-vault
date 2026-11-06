@@ -201,6 +201,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["pending", "confirmed", "rejected", "stale", "needs_review"],
     )
     claim_review.add_argument("--allow-conflicts", action="store_true")
+    claim_review.add_argument("--replaces", type=int, help="retire this confirmed claim atomically")
+
+    context = subparsers.add_parser("context", help="read relevant confirmed task context")
+    context.add_argument("--term", action="append", required=True, help="literal topic term; repeat for alternatives")
+    context.add_argument("--limit", type=int, default=5)
 
     export = subparsers.add_parser("export", help="export the confirmed profile")
     export.add_argument("--format", choices=["json", "markdown"], default="json")
@@ -214,6 +219,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def run(args: argparse.Namespace) -> Any:
+    if args.command == "context":
+        from .task_context import retrieve
+        return retrieve(args.db, args.term, args.limit)
     store = Store(args.db)
     try:
         if args.command == "init":
@@ -327,6 +335,7 @@ def run(args: argparse.Namespace) -> Any:
                     args.id,
                     status=args.status,
                     allow_conflicts=args.allow_conflicts,
+                    replaces=args.replaces,
                 )
                 return {"ok": True, "claim_id": args.id, "status": args.status}
 
